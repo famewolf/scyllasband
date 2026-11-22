@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Scylla\'s Band TTS</string>
+    <string name="brand">Scylla\'s Band</string>
+    <string name="voice_ready">Voice: Ready</string>
+    <string name="voice_needed">Download required</string>
+    <string name="model_status">Voice model: %1$s</string>
+    <string name="model_missing">Not downloaded</string>
+    <string name="model_ready">Ready</string>
+    <string name="download_model">Download voice model (~470 MB)</string>
+    <string name="voices_title">Voices</string>
+    <string name="play_sample">▶</string>
+    <string name="play_sample_cd">Play sample of selected voice</string>
+    <string name="use_voice">Use</string>
+    <string name="change_voice">Change ▾</string>
+    <string name="choose_voices">Choose voices ▾</string>
+    <string name="random_voice_label">Random voices</string>
+    <string name="random_voice_hint">(rotates)</string>
+    <string name="local_test_hint">Type text to test the local voice</string>
+    <string name="local_test_default">Delivery settings change how the on-device voice sounds. Change the sliders, then tap Speak locally again with this same phrase to compare.</string>
+    <string name="clear_test">Clear</string>
+    <string name="delivery_note">Play uses the sliders. Play sample is a fixed studio recording and never changes.</string>
+    <string name="local_test_button">Play</string>
+    <string name="system_settings">Android TTS settings</string>
+    <string name="sample_failed">Could not play sample (offline?)</string>
+    <string name="downloading">Downloading %1$d%%</string>
+    <string name="download_complete">Download complete. Voice model ready.</string>
+    <string name="download_failed">Download failed: %1$s — tap Download to retry.</string>
+
+    <string name="delivery_title">Delivery</string>
+    <string name="intensity_label">Intensity</string>
+    <string name="rate_label">Speech rate</string>
+    <string name="pitch_label">Pitch</string>
+    <string name="reset_delivery">Reset</string>
+    <string name="section_tuning">Voice tuning</string>
+    <string name="section_words">Word Replacement</string>
+    <string name="expand">Tap to expand</string>
+    <string name="collapse">Tap to collapse</string>
+    <string name="last_voice_none">Last spoken by: —</string>
+    <string name="last_voice">Last spoken by: %1$s</string>
+    <string name="exclude_title">Voices to exclude from Random</string>
+
+    <string name="spoken_label">Speaking: %1$s</string>
+    <string name="demo_random">▶</string>
+    <string name="demo_random_cd">Demo random voices</string>
+    <string name="demo_random_info">Random keeps rotating between allowed voices. It is not a one-time pick: one voice is used until 5 minutes of idle time pass, then a different one is chosen. Uncheck voices you don\'t want.</string>
+    <string name="demo_line_1">Random does not pick one voice forever, it keeps rotating between the allowed voices</string>
+    <string name="demo_line_2">it uses one voice for a while, then switches to a different one after five minutes of idle time</string>
+    <string name="demo_line_3">voices you uncheck are never used, so you can leave out any you find hard to understand</string>
+    <string name="demo_spoken">%1$s: %2$s</string>
+
+    <string name="pron_title">Word Replacement</string>
+    <string name="pron_word_hint">Word to fix</string>
+    <string name="pron_spelling_hint">Spell it like it sounds (e.g. gah-rodge)</string>
+    <string name="pron_convert">Convert to phones</string>
+    <string name="pron_play">Play correction</string>
+    <string name="pron_save">Save</string>
+    <string name="pron_list">List / remove overrides</string>
+    <string name="pron_done">Done</string>
+    <string name="pron_need_both">Enter a word and a spelling</string>
+    <string name="pron_failed">Could not convert</string>
+    <string name="pron_convert_first">Convert a spelling first</string>
+    <string name="pron_saved">Saved %1$s</string>
+    <string name="pron_removed">Removed %1$s</string>
+    <string name="pron_empty">No overrides yet</string>
+</resources>

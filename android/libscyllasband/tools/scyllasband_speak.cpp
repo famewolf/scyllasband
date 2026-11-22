@@ -1,0 +1,312 @@
+// scyllasband_speak: synthesize text (or sing a melody score) with libscyllasband and write a 16-bit PCM WAV.
+#include "scyllasband.h"
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+const char* kUsage =
+    "usage: scyllasband_speak --bundle DIR --voice ID (--text TEXT | --file PATH | --score SCORE.json) [--output OUT.wav]\n"
+    "  [--language CODE] [--delivery SPEC] [--speed 1.0] [--steps N] [--sampler heun|euler] [--seed N]\n"
+    "  [--temperature 1.0] [--threads N] [--accelerator cpu|gpu|auto|ane] [--no-normalize] [--metadata OUT.json]\n"
+    "  [--plan-only] [--stream] [--warmup] [--timings N]\n"
+    "  --timings N: speak the text N times in this process and print load, warm-up and per-request first-audio and total\n"
+    "  --timings-file PATH: speak each line of PATH once in this process (new text every request, so the G2P runs on the\n"
+    "    path to first audio), after one request with the first line; prints the timings only, never the text\n"
+    "  times as JSON (the first request includes opening its graphs; later ones show a warm runtime)\n"
+    "  --score PATH: sing a melody score (JSON: text, bpm, style, notes) on a v4 bundle instead of speaking; with\n"
+    "    [--decoder bigvgan|vocos] [--turbo-sing] (= --decoder vocos) [--sing-steps N] [--guidance G] [--transpose N]\n"
+    "    [--no-register]; --steps, --sampler, --seed, --metadata, --plan-only, --stream and --timings apply as for speech\n"
+    "    (--timings: first_audio_ms is the first phrase's audio, audio_s the song's length, rtf_x audio_s per second)\n";
+
+double milliseconds_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+void write_wav(const std::string& path, const float* samples, int64_t count, int32_t rate) {
+    std::ofstream out(path, std::ios::binary);
+    auto u32 = [&](uint32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { out.write(reinterpret_cast<const char*>(&v), 2); };
+    const uint32_t bytes = static_cast<uint32_t>(count * 2);
+    out.write("RIFF", 4);
+    u32(36 + bytes);
+    out.write("WAVEfmt ", 8);
+    u32(16);
+    u16(1);
+    u16(1);
+    u32(static_cast<uint32_t>(rate));
+    u32(static_cast<uint32_t>(rate) * 2);
+    u16(2);
+    u16(16);
+    out.write("data", 4);
+    u32(bytes);
+    for (int64_t i = 0; i < count; ++i) {
+        float clipped = std::fmax(-1.0f, std::fmin(1.0f, samples[i]));
+        u16(static_cast<uint16_t>(static_cast<int16_t>(std::lrint(clipped * 32767.0f))));
+    }
+}
+
+int fail(const char* what) {
+    std::fprintf(stderr, "scyllasband_speak: %s: %s\n", what, scyllasband_last_error());
+    return 1;
+}
+
+}  // namespace
+
+// --score: sing the score once (or --timings times) and report like speech.
+int sing_main(ScyllasBandRuntime* runtime, ScyllasBandSingRequest& request, const std::string& output, const std::string& metadata_path,
+              bool plan_only, bool stream, int timings, double load_ms, double warmup_ms) {
+    struct Timing {
+        std::chrono::steady_clock::time_point start;
+        double first_audio_ms = -1.0;
+        int64_t song_samples = 0;
+        int32_t rate = 24000;
+        int phrases = 0;
+        bool print = false;
+        std::vector<float> song;
+    };
+    auto callback = [](const ScyllasBandEvent* event, void* user) -> int32_t {
+        auto* t = static_cast<Timing*>(user);
+        if (t->print) std::fprintf(stderr, "[%d] %s %s\n", static_cast<int>(event->type), event->chunk_id ? event->chunk_id : "-", event->metadata_json);
+        if (event->type == SCYLLASBAND_EVENT_PLAN) {
+            const char* key = std::strstr(event->metadata_json, "\"samples\":");
+            t->song_samples = key ? std::atoll(key + 10) : 0;
+            t->song.reserve(static_cast<std::size_t>(t->song_samples));
+        }
+        // Each phrase's AUDIO event carries the song samples it settled, contiguous with the previous ones: append them.
+        if (event->type == SCYLLASBAND_EVENT_AUDIO) {
+            if (t->first_audio_ms < 0 && event->sample_count > 0) t->first_audio_ms = milliseconds_since(t->start);
+            t->rate = event->sample_rate;
+            ++t->phrases;
+            t->song.insert(t->song.end(), event->samples, event->samples + event->sample_count);
+        }
+        return 0;
+    };
+    int status = 0;
+    if (plan_only) {
+        char* plan = nullptr;
+        if (scyllasband_sing_plan_json(runtime, &request, &plan) != SCYLLASBAND_OK) status = fail("planning failed");
+        else std::printf("%s\n", plan);
+        scyllasband_string_free(plan);
+    } else if (timings > 0) {
+        std::printf("{\"load_ms\": %.1f, \"warmup_ms\": %.1f, \"requests\": [", load_ms, warmup_ms);
+        for (int run = 0; run < timings && status == 0; ++run) {
+            Timing timing{std::chrono::steady_clock::now()};
+            if (scyllasband_sing_stream(runtime, &request, callback, &timing) != SCYLLASBAND_OK) {
+                status = fail("singing failed");
+                break;
+            }
+            const double total_ms = milliseconds_since(timing.start), audio_s = static_cast<double>(timing.song_samples) / timing.rate;
+            std::printf("%s{\"first_audio_ms\": %.1f, \"total_ms\": %.1f, \"audio_s\": %.3f, \"rtf_x\": %.3f, \"phrases\": %d}", run ? ", " : "",
+                        timing.first_audio_ms, total_ms, audio_s, audio_s / (total_ms / 1000.0), timing.phrases);
+            if (run == 0 && !output.empty()) write_wav(output, timing.song.data(), static_cast<int64_t>(timing.song.size()), timing.rate);
+        }
+        std::printf("]}\n");
+    } else if (stream) {
+        Timing timing{std::chrono::steady_clock::now()};
+        timing.print = true;
+        if (scyllasband_sing_stream(runtime, &request, callback, &timing) != SCYLLASBAND_OK) status = fail("singing failed");
+        else if (!output.empty()) write_wav(output, timing.song.data(), static_cast<int64_t>(timing.song.size()), timing.rate);
+    } else {
+        ScyllasBandAudio audio{};
+        const auto start = std::chrono::steady_clock::now();
+        if (scyllasband_sing(runtime, &request, &audio) != SCYLLASBAND_OK) {
+            status = fail("singing failed");
+        } else {
+            const double total_ms = milliseconds_since(start);
+            if (!output.empty()) write_wav(output, audio.samples, audio.sample_count, audio.sample_rate);
+            if (!metadata_path.empty()) std::ofstream(metadata_path) << audio.metadata_json;
+            std::fprintf(stderr, "%lld samples at %d Hz in %.1f ms (load %.1f ms)\n", static_cast<long long>(audio.sample_count), audio.sample_rate,
+                         total_ms, load_ms);
+        }
+        scyllasband_audio_free(&audio);
+    }
+    return status;
+}
+
+int main(int argc, char** argv) {
+    std::string bundle, text, output, metadata_path, sampler, accelerator = "cpu";
+    std::string score, decoder;
+    ScyllasBandSingRequest sing_request;
+    scyllasband_sing_request_init(&sing_request);
+    int sing_steps = 0;
+    ScyllasBandRequest request;
+    scyllasband_request_init(&request);
+    std::string voice, language, delivery;
+    bool plan_only = false, stream = false, warm = false;
+    int threads = 0, timings = 0;
+    std::vector<std::string> timing_lines;  // --timings-file: one request per line
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto value = [&]() -> std::string {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s needs a value\n%s", arg.c_str(), kUsage);
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (arg == "--bundle") bundle = value();
+        else if (arg == "--text") text = value();
+        else if (arg == "--file") {
+            std::ifstream in(value());
+            std::stringstream buffer;
+            buffer << in.rdbuf();
+            text = buffer.str();
+        } else if (arg == "--voice") voice = value();
+        else if (arg == "--language") language = value();
+        else if (arg == "--delivery") delivery = value();
+        else if (arg == "--speed") request.speed = std::stof(value());
+        else if (arg == "--steps") request.steps = std::stoi(value());
+        else if (arg == "--sampler") sampler = value();
+        else if (arg == "--seed") request.seed = std::stoull(value()), request.has_seed = 1;
+        else if (arg == "--temperature") request.temperature = std::stof(value());
+        else if (arg == "--threads") threads = std::stoi(value());
+        else if (arg == "--accelerator") accelerator = value();
+        else if (arg == "--no-normalize") request.normalize_text = 0;
+        else if (arg == "--output") output = value();
+        else if (arg == "--metadata") metadata_path = value();
+        else if (arg == "--plan-only") plan_only = true;
+        else if (arg == "--stream") stream = true;
+        else if (arg == "--warmup") warm = true;
+        else if (arg == "--timings") timings = std::stoi(value());
+        else if (arg == "--score") {
+            std::ifstream in(value());
+            std::stringstream buffer;
+            buffer << in.rdbuf();
+            score = buffer.str();
+            if (score.empty()) return fail("--score: cannot read the score");
+        } else if (arg == "--decoder") decoder = value();
+        else if (arg == "--turbo-sing" || arg == "--turboSing") decoder = "vocos";
+        else if (arg == "--sing-steps") sing_steps = std::stoi(value());
+        else if (arg == "--guidance") {
+            sing_request.guidance = std::stof(value());
+            sing_request.has_guidance = 1;
+        }
+        else if (arg == "--transpose") sing_request.transpose = std::stoi(value());
+        else if (arg == "--no-register") sing_request.use_register = 0;
+        else if (arg == "--timings-file") {
+            std::ifstream in(value());
+            for (std::string line; std::getline(in, line);) {
+                if (!line.empty()) timing_lines.push_back(line);
+            }
+            if (timing_lines.size() < 2) return fail("--timings-file needs at least two lines");
+            timings = static_cast<int>(timing_lines.size());
+        }
+        else {
+            std::fprintf(stderr, "unknown argument %s\n%s", arg.c_str(), kUsage);
+            return 2;
+        }
+    }
+    if (text.empty() && !timing_lines.empty()) text = timing_lines.front();
+    if (bundle.empty() || voice.empty() || (text.empty() && score.empty())) {
+        std::fprintf(stderr, "%s", kUsage);
+        return 2;
+    }
+    request.text = text.c_str();
+    request.voice_id = voice.c_str();
+    request.language = language.empty() ? nullptr : language.c_str();
+    request.delivery = delivery.empty() ? nullptr : delivery.c_str();
+    request.sampler = sampler == "euler" ? SCYLLASBAND_SAMPLER_EULER : sampler == "heun" ? SCYLLASBAND_SAMPLER_HEUN : SCYLLASBAND_SAMPLER_DEFAULT;
+
+    ScyllasBandRuntimeOptions options{};
+    options.bundle_dir = bundle.c_str();
+    options.threads = threads;
+    options.accelerator = accelerator == "gpu"    ? SCYLLASBAND_ACCELERATOR_GPU
+                          : accelerator == "auto" ? SCYLLASBAND_ACCELERATOR_AUTO
+                          : accelerator == "ane"  ? SCYLLASBAND_ACCELERATOR_NEURAL_ENGINE
+                                                  : SCYLLASBAND_ACCELERATOR_CPU;
+    ScyllasBandRuntime* runtime = nullptr;
+    const auto load_start = std::chrono::steady_clock::now();
+    if (scyllasband_runtime_create(&options, &runtime) != SCYLLASBAND_OK) return fail("cannot load the bundle");
+    const double load_ms = milliseconds_since(load_start);
+    double warmup_ms = 0.0;
+    if (warm) {
+        const auto start = std::chrono::steady_clock::now();
+        if (scyllasband_warmup(runtime, voice.c_str()) != SCYLLASBAND_OK) return fail("warm-up failed");
+        warmup_ms = milliseconds_since(start);
+    }
+
+    int status = 0;
+    if (!score.empty()) {
+        sing_request.score_json = score.c_str();
+        sing_request.voice_id = voice.c_str();
+        sing_request.language = request.language;
+        sing_request.steps = sing_steps > 0 ? sing_steps : request.steps;
+        sing_request.sampler = request.sampler;
+        sing_request.seed = request.seed;
+        sing_request.has_seed = request.has_seed;
+        sing_request.decoder = decoder.empty() ? nullptr : decoder.c_str();
+        status = sing_main(runtime, sing_request, output, metadata_path, plan_only, stream, timings, load_ms, warmup_ms);
+    } else if (timings > 0) {
+        struct Timing {
+            std::chrono::steady_clock::time_point start;
+            double first_audio_ms = -1.0;
+            int64_t samples = 0;
+            int32_t rate = 24000;
+        };
+        std::printf("{\"load_ms\": %.1f, \"warmup_ms\": %.1f, \"requests\": [", load_ms, warmup_ms);
+        for (int run = 0; run < timings && status == 0; ++run) {
+            if (!timing_lines.empty()) request.text = timing_lines[static_cast<std::size_t>(run)].c_str();
+            Timing timing{std::chrono::steady_clock::now()};
+            auto callback = [](const ScyllasBandEvent* event, void* user) -> int32_t {
+                auto* t = static_cast<Timing*>(user);
+                if (event->type == SCYLLASBAND_EVENT_AUDIO) {
+                    if (t->first_audio_ms < 0) t->first_audio_ms = milliseconds_since(t->start);
+                    t->samples += event->sample_count;
+                    t->rate = event->sample_rate;
+                }
+                return 0;
+            };
+            if (scyllasband_synthesize_stream(runtime, &request, callback, &timing) != SCYLLASBAND_OK) {
+                status = fail("synthesis failed");
+                break;
+            }
+            const double total_ms = milliseconds_since(timing.start);
+            std::printf("%s{\"first_audio_ms\": %.1f, \"total_ms\": %.1f, \"audio_s\": %.3f}", run ? ", " : "", timing.first_audio_ms, total_ms,
+                        static_cast<double>(timing.samples) / timing.rate);
+        }
+        std::printf("]}\n");
+    } else if (plan_only) {
+        char* plan = nullptr;
+        if (scyllasband_plan_json(runtime, &request, &plan) != SCYLLASBAND_OK) status = fail("planning failed");
+        else std::printf("%s\n", plan);
+        scyllasband_string_free(plan);
+    } else if (stream) {
+        struct State {
+            std::vector<float> samples;
+            int32_t rate = 0;
+        } state;
+        auto callback = [](const ScyllasBandEvent* event, void* user) -> int32_t {
+            auto* s = static_cast<State*>(user);
+            std::fprintf(stderr, "[%d] %s %s\n", static_cast<int>(event->type), event->chunk_id ? event->chunk_id : "-", event->metadata_json);
+            if (event->type == SCYLLASBAND_EVENT_AUDIO) {
+                s->samples.insert(s->samples.end(), event->samples, event->samples + event->sample_count);
+                s->rate = event->sample_rate;
+            }
+            return 0;
+        };
+        if (scyllasband_synthesize_stream(runtime, &request, callback, &state) != SCYLLASBAND_OK) status = fail("synthesis failed");
+        else if (!output.empty()) write_wav(output, state.samples.data(), static_cast<int64_t>(state.samples.size()), state.rate);
+    } else {
+        ScyllasBandAudio audio{};
+        if (scyllasband_synthesize(runtime, &request, &audio) != SCYLLASBAND_OK) {
+            status = fail("synthesis failed");
+        } else {
+            if (!output.empty()) write_wav(output, audio.samples, audio.sample_count, audio.sample_rate);
+            if (!metadata_path.empty()) std::ofstream(metadata_path) << audio.metadata_json;
+            std::fprintf(stderr, "%lld samples at %d Hz\n", static_cast<long long>(audio.sample_count), audio.sample_rate);
+        }
+        scyllasband_audio_free(&audio);
+    }
+    scyllasband_runtime_destroy(runtime);
+    return status;
+}
